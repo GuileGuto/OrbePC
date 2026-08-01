@@ -134,7 +134,7 @@ import atualizacao_engine
 # versao deste app -- comparada com a tag da release mais recente no
 # GitHub (ver atualizacao_engine.py) pra avisar quando tiver uma nova.
 # Suba isso a cada release publicada no repositorio.
-APP_VERSAO = "1.4.2"
+APP_VERSAO = "1.4.3"
 
 # de quanto em quanto tempo o app re-confere se tem versao nova do app/
 # firmware no GitHub Releases, enquanto fica aberto (ver verificar_atualizacoes()
@@ -2035,6 +2035,12 @@ def abrir_janela_configuracoes(master):
                 btn_selecionar.configure(state="normal")
                 if erro is None:
                     escrever_log("✔ Firmware gravado com sucesso. O display deve reiniciar sozinho.")
+                    # limpa a versao conhecida -- o ESP32 acabou de reiniciar com
+                    # firmware novo, mas o app so re-pergunta a versao (REQVERSAO)
+                    # quando versao_firmware esta None (ver linha ~682/826). Sem
+                    # isso, "Versao instalada" e o banner de firmware ficavam
+                    # travados no valor antigo ate o app ser fechado e reaberto.
+                    estado.atualizar(versao_firmware=None)
                 else:
                     escrever_log(f"✘ Falha ao gravar: {erro}")
                 pausar_para_flash.clear()  # devolve a porta pro monitoramento normal
