@@ -1,0 +1,11 @@
+# Saida de build (PyInstaller e Arduino IDE) -- gerada a partir do codigo-
+# fonte, nao precisa ficar versionada. Os .exe de release vao anexados
+# direto na Release do GitHub, nao no repositorio.
+build/
+dist/
+__pycache__/
+*.pyc
+
+# arquivos de lock/temporarios do SolidWorks
+~$*.SLDPRT
+~$*.SLDASM

@@ -1,0 +1,8 @@
+pyserial
+requests
+pystray
+Pillow
+pythonnet
+HardwareMonitor>=1.2.0
+customtkinter
+esptool
