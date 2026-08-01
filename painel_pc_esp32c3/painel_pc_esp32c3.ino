@@ -47,7 +47,7 @@
 // Versao deste firmware -- reportada no boot (DBG:versao=...), aparece
 // na aba Firmware do app como "versao instalada". Formato livre
 // (major.minor.patch sugerido).
-#define FIRMWARE_VERSAO "1.4.0"
+#define FIRMWARE_VERSAO "1.5.2"
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_GC9A01A.h>
@@ -193,6 +193,10 @@ void desenharMarcaEscala(int indice);
 void restaurarMarcasNaFaixa(int inicio, int fim);
 void aoTrocarDePagina();
 void desenharPainelCustom();
+void iniciarVarreduraBoot();
+void animarVarreduraBoot();
+void iniciarCortina();
+void animarCortina();
 
 // ---------------- SPLASH DE INICIALIZACAO ----------------
 // arco laranja girando continuamente ao redor do logo "OrbePC", enquanto
@@ -209,20 +213,38 @@ const int SPINNER_PASSO = 5;  // graus por passo -- controla a velocidade do gir
 bool emTransicao = false;
 int alvoAlinhamentoSpinner = 0; // angulo (sempre crescente) onde o spinner encontra o inicio do gauge
 
+// varredura de boot ("teste dos mostradores", ver iniciarVarreduraBoot() mais
+// abaixo) e cortina de transicao entre telas (ver iniciarCortina() mais
+// abaixo) -- as flags/variaveis de estado precisam estar declaradas AQUI EM
+// CIMA (antes de loop()/processarLinha()/mensagemCentral(), que as usam):
+// diferente de funcao, o Arduino NAO gera prototipo automatico pra
+// variavel global, entao declarar so' perto da funcao (mais abaixo no
+// arquivo) da erro de compilacao "nao declarado nesse escopo".
+bool emVarreduraBoot = false;
+int faseVarreduraBoot = 0; // 0 = parada; 1 = indo pro maximo; 2 = voltando pro zero
+
+bool emCortina = false;
+int cortinaX = 0;
+const int CORTINA_PASSO = 24; // pixels cobertos por passo -- ~200ms pra tela inteira (240px)
+
 const float GAUGE_INICIO = 135;
 const float GAUGE_FIM    = 405; // 270 graus de varredura
 
 // grau ATUAL desenhado na tela e grau ALVO (pra onde o anel esta indo).
-// A animacao move "grauAtual" um pouco por vez em direcao a "grauAlvo",
-// em vez de saltar direto -- fica com um movimento mais suave/natural.
+// grauCpuAtual/grauGpuAtual sao o valor JA DESENHADO (inteiro, em graus) --
+// grauCpuAtualF/grauGpuAtualF sao a posicao EXATA (com casas decimais) que a
+// fisica de mola usa por baixo dos panos; a cada passo ela e' arredondada pra
+// decidir se ja mudou grau o bastante pra valer a pena redesenhar 1px.
 int grauCpuAtual = (int)round(GAUGE_INICIO);
 int grauCpuAlvo  = (int)round(GAUGE_INICIO);
 int grauGpuAtual = (int)round(GAUGE_INICIO);
 int grauGpuAlvo  = (int)round(GAUGE_INICIO);
 
+float grauCpuAtualF = GAUGE_INICIO;
+float grauGpuAtualF = GAUGE_INICIO;
+
 // velocidade ATUAL de cada anel (graus por passo de animacao) -- guardada
-// entre os quadros pra dar acelerada/freada, tipo um carro: comeca devagar,
-// ganha velocidade, e freia suave perto do alvo em vez de parar seco.
+// entre os quadros, e' o que da a "inercia" da mola (ver animarUmAnel()).
 float velCpuAtual = 0;
 float velGpuAtual = 0;
 
@@ -231,10 +253,33 @@ bool escalaDesenhada = false; // true depois que os tracinhos/numeros da escala 
 
 unsigned long ultimaAnimacao = 0;
 const unsigned long INTERVALO_ANIMACAO = 20; // ms entre passos da animacao
-const float ANEL_ACEL    = 0.35; // aceleracao dos aneis (graus/passo^2) -- "pisar fundo"
-const float ANEL_VEL_MAX = 7.0;  // velocidade maxima dos aneis (graus por passo)
-                                  // suba ANEL_ACEL pra acelerar/frear mais rapido,
-                                  // suba ANEL_VEL_MAX pra ter uma velocidade de cruzeiro maior.
+
+// ---------------- FISICA DE MOLA DOS PONTEIROS ----------------
+// Antes disso os aneis se moviam com aceleracao/freio tipo carro (MRUV),
+// sempre parando EXATAMENTE no alvo, sem nenhuma sobra de movimento. Agora
+// e' um sistema massa-mola-amortecedor de verdade: o ponteiro passa um
+// pouco do valor final e volta, como a agulha mecanica de um velocimetro
+// de carro de verdade "balancando" ao assentar. A cada passo de animacao:
+//   velocidade += (alvo - posicao) * RIGIDEZ   -- a "mola" puxa pro alvo
+//   velocidade -= velocidade * AMORTECIMENTO   -- tira energia aos poucos
+//   posicao    += velocidade
+// RIGIDEZ mais alta = reage mais rapido (mola mais dura). AMORTECIMENTO
+// mais baixo = balanca mais (sub-amortecido, bounce mais visivel); mais
+// alto = assenta sem balancar. Os valores abaixo foram escolhidos pra dar
+// 1 balancinho pequeno e visivel sem ficar tremendo por muito tempo -- se
+// nao gostar do "jeito" na tela de verdade, mexa neles a vontade.
+const float ANEL_RIGIDEZ = 0.09;
+const float ANEL_AMORTECIMENTO = 0.32;
+const float ANEL_PARADO_EPS = 0.06; // graus -- abaixo disso (posicao E velocidade) conta como "chegou"
+
+// a varredura de boot (teste dos mostradores, ver animarVarreduraBoot() mais
+// abaixo) usa a MESMA fisica de mola, mas com constantes proprias BEM mais
+// lentas -- RIGIDEZ baixa significa reagir mais devagar ao "alvo", entao a
+// varredura ate o maximo e de volta demora visivelmente mais (~1-2s cada
+// trecho), em vez de passar num piscar de olhos como as constantes normais
+// (ANEL_RIGIDEZ, ajustadas pra responder rapido aos dados reais do PC).
+const float VARREDURA_RIGIDEZ = 0.012;
+const float VARREDURA_AMORTECIMENTO = 0.22;
 
 // Diagnostico: se o ULTIMO reset foi anormal (crash, watchdog, queda de
 // energia), avisa em vermelho por 2s antes do splash. Reset normal
@@ -299,6 +344,10 @@ void loop() {
       animarSplash();
     } else if (emTransicao) {
       animarTransicaoSaidaSplash();
+    } else if (emVarreduraBoot) {
+      animarVarreduraBoot();
+    } else if (emCortina) {
+      animarCortina();
     } else {
       animarAneis();
     }
@@ -311,7 +360,9 @@ void loop() {
   // mesmo caminho animado de sempre (spinner desliza e vira os aneis).
   if (millis() - ultimoDadoRecebido > TIMEOUT_SEM_DADOS) {
     if (!mostrandoSplash) {
-      emTransicao = false; // cancela uma transicao no meio, por seguranca
+      emTransicao = false;      // cancela uma transicao no meio, por seguranca
+      emVarreduraBoot = false;  // idem pra varredura de boot
+      emCortina = false;        // idem pra cortina de troca de tela
       mostrarSplash();
     }
   }
@@ -487,6 +538,7 @@ void processarLinha(String linha) {
     escalaDesenhada = false;
     grauCpuAtual = (int)round(GAUGE_INICIO);
     grauGpuAtual = (int)round(GAUGE_INICIO);
+    grauCpuAtualF = grauGpuAtualF = GAUGE_INICIO;
     velCpuAtual = 0;
     velGpuAtual = 0;
     for (int i = 0; i < 4; i++) linhasDesenhadas[i] = ""; // tela limpa -- linhas custom precisam redesenhar
@@ -496,8 +548,8 @@ void processarLinha(String linha) {
 
   if (mostrandoSplash) {
     iniciarTransicaoSaidaSplash(); // primeiro dado chegou -- sai do splash animado
-  } else if (!emTransicao) {
-    desenharPainel(); // durante a transicao, so atualiza "dados" e espera ela terminar
+  } else if (!emTransicao && !emVarreduraBoot && !emCortina) {
+    desenharPainel(); // durante essas fases, so atualiza "dados" e espera elas terminarem
   }
 }
 
@@ -506,6 +558,8 @@ void mensagemCentral(String msg) {
   mostrandoMensagem = true;
   mostrandoSplash = false; // qualquer mensagem de texto encerra o spinner de boot
   emTransicao = false;     // e cancela uma transicao em andamento, por seguranca
+  emVarreduraBoot = false; // idem pra varredura de boot
+  emCortina = false;       // idem pra cortina de troca de tela
   escalaDesenhada = false; // a tela vai ser limpa, a escala precisa ser redesenhada depois
   gfx->fillScreen(0x0000);
   gfx->setTextColor(0xFFFF);
@@ -623,6 +677,7 @@ void plantarAneisEEncerrarTransicao() {
   int inicio = (int)round(GAUGE_INICIO);
   grauCpuAtual = grauCpuAlvo = inicio;
   grauGpuAtual = grauGpuAlvo = inicio;
+  grauCpuAtualF = grauGpuAtualF = GAUGE_INICIO;
   velCpuAtual = 0;
   velGpuAtual = 0;
 
@@ -630,6 +685,11 @@ void plantarAneisEEncerrarTransicao() {
   mostrandoMensagem = false;
   aneisPrecisamRedesenho = false; // os aneis ja foram plantados aqui -- nao deixa desenharPainel() resetar
   desenharPainel(); // desenha o resto (textos) com os ultimos dados recebidos
+
+  iniciarVarreduraBoot(); // "teste dos mostradores" estilo painel de carro:
+                          // os aneis varrem ate o maximo e voltam a zero
+                          // antes de assentar no valor real -- so' acontece
+                          // uma vez, aqui, na saida do splash
 }
 
 // centraliza um texto horizontalmente em torno de CX, na altura Y
@@ -717,41 +777,52 @@ void desenharArco(int raio, int espessura, float anguloIni, float anguloFim, uin
 int restauraIni[2], restauraFim[2];
 int restauraPendentes = 0;
 
-// move um anel 1 passo em direcao ao alvo com aceleracao tipo carro: comeca
-// devagar (parado -> acelerando), ganha velocidade ate ANEL_VEL_MAX e, perto
-// do alvo, freia (desacelera) pra chegar suave em vez de bater seco. Recebe
-// a velocidade atual por referencia pra lembrar dela entre os quadros.
-// So desenha o pedacinho que mudou nesse passo.
-void animarUmAnel(int raio, int espessura, int &grauAtual, int grauAlvo, uint16_t cor, float &velAtual) {
-  if (grauAtual == grauAlvo) {
-    velAtual = 0; // parado -- proxima vez que sair do lugar, comeca do zero de novo
+// move um anel 1 passo em direcao ao alvo com fisica de mola-amortecedor
+// (ver comentario "FISICA DE MOLA DOS PONTEIROS" mais acima) -- passa um
+// pouco do alvo e volta, em vez de parar seco exatamente em cima dele.
+// grauAtualF guarda a posicao exata (com casas decimais) entre os quadros;
+// grauAtual e' so' o ultimo valor DESENHADO (inteiro), usado pra saber
+// quanto redesenhar. So desenha o pedacinho que mudou nesse passo.
+// rigidez/amortecimento vem por parametro pra essa mesma funcao servir tanto
+// os aneis normais (ANEL_RIGIDEZ/ANEL_AMORTECIMENTO, resposta rapida aos
+// dados reais) quanto a varredura de boot (VARREDURA_*, propositalmente
+// bem mais lenta -- ver animarVarreduraBoot()).
+void animarUmAnel(int raio, int espessura, int &grauAtual, float &grauAtualF, int grauAlvo, uint16_t cor, float &velAtual, float rigidez, float amortecimento) {
+  // ja chegou (posicao E velocidade pertinho do alvo) -- nada a fazer
+  if (fabs(velAtual) < ANEL_PARADO_EPS && fabs(grauAtualF - grauAlvo) < ANEL_PARADO_EPS) {
+    velAtual = 0;
     return;
   }
 
-  int diferenca = grauAlvo - grauAtual;
-  int dir = (diferenca > 0) ? 1 : -1;
-  float distancia = (float)abs(diferenca);
+  velAtual += ((float)grauAlvo - grauAtualF) * rigidez;
+  velAtual -= velAtual * amortecimento;
+  velAtual = constrain(velAtual, -80.0f, 80.0f); // rede de seguranca -- a mola sozinha nao deveria chegar perto disso
 
-  // distancia que essa velocidade precisaria pra freiar ate zero (fisica de
-  // MRUV: d = v^2 / (2*a)) -- se ja estamos dentro dessa distancia do alvo,
-  // comeca a frear; senao, continua acelerando
-  float distanciaFreio = (velAtual * velAtual) / (2.0 * ANEL_ACEL);
-  if (distanciaFreio >= distancia) {
-    velAtual -= ANEL_ACEL;
-  } else {
-    velAtual += ANEL_ACEL;
+  grauAtualF += velAtual;
+
+  // PISO: 0% (GAUGE_INICIO) e' o minimo absoluto do anel -- nao existe
+  // "menos que zero" fill. Sem esse trava, um balanco sub-amortecido perto
+  // do zero podia empurrar grauAtualF um pouco ABAIXO de GAUGE_INICIO e,
+  // ao corrigir de volta pra cima, esse trechinho era desenhado NA COR (o
+  // "crescer" e "encolher" so' decidem pela comparacao com o grau anterior,
+  // sem saber se aquele trecho e' valido) -- ficava uma sobra colorida
+  // permanente logo antes da marca de "0", mesmo com o valor real zerado.
+  // Esse era o resto azul/verde que sobrava depois da varredura de boot.
+  if (grauAtualF < GAUGE_INICIO) {
+    grauAtualF = GAUGE_INICIO;
+    velAtual = 0; // "bateu no chao" -- para ali, sem quicar de volta
   }
-  velAtual = constrain(velAtual, 0.0, ANEL_VEL_MAX);
 
-  int passo = (int)round(velAtual);
-  if (passo < 1) passo = 1;       // nunca trava parado enquanto houver distancia a percorrer
-  if (passo > distancia) passo = (int)distancia; // nao ultrapassa o alvo
-  passo *= dir;
-
-  int novoGrau = grauAtual + passo;
-  if ((passo > 0 && novoGrau > grauAlvo) || (passo < 0 && novoGrau < grauAlvo)) {
-    novoGrau = grauAlvo; // nao ultrapassa o alvo
+  // "chegou": gruda no valor exato e zera a velocidade -- senao a mola
+  // nunca converge 100% a zero e ficaria desenhando (e gastando CPU) pra
+  // sempre numa oscilacao microscopica
+  if (fabs((float)grauAlvo - grauAtualF) < ANEL_PARADO_EPS && fabs(velAtual) < ANEL_PARADO_EPS) {
+    grauAtualF = grauAlvo;
+    velAtual = 0;
   }
+
+  int novoGrau = (int)round(grauAtualF);
+  if (novoGrau == grauAtual) return; // ainda no mesmo grau desenhado -- nada pra redesenhar
 
   if (novoGrau > grauAtual) {
     desenharArco(raio, espessura, grauAtual, novoGrau, cor, true);
@@ -775,11 +846,13 @@ void animarUmAnel(int raio, int espessura, int &grauAtual, int grauAlvo, uint16_
 // ao ultimo valor recebido
 void animarAneis() {
   if (mostrandoMensagem) return;
-  if (grauCpuAtual == grauCpuAlvo && grauGpuAtual == grauGpuAlvo) return;
+  bool cpuParado = fabs(velCpuAtual) < ANEL_PARADO_EPS && fabs(grauCpuAtualF - grauCpuAlvo) < ANEL_PARADO_EPS;
+  bool gpuParado = fabs(velGpuAtual) < ANEL_PARADO_EPS && fabs(grauGpuAtualF - grauGpuAlvo) < ANEL_PARADO_EPS;
+  if (cpuParado && gpuParado) return;
 
   gfx->startWrite();
-  animarUmAnel(114, 8, grauCpuAtual, grauCpuAlvo, corCpuFixa, velCpuAtual);
-  animarUmAnel(94, 7, grauGpuAtual, grauGpuAlvo, corGpuFixa, velGpuAtual);
+  animarUmAnel(114, 8, grauCpuAtual, grauCpuAtualF, grauCpuAlvo, corCpuFixa, velCpuAtual, ANEL_RIGIDEZ, ANEL_AMORTECIMENTO);
+  animarUmAnel(94, 7, grauGpuAtual, grauGpuAtualF, grauGpuAlvo, corGpuFixa, velGpuAtual, ANEL_RIGIDEZ, ANEL_AMORTECIMENTO);
   gfx->endWrite();
 
   // restaura marcas de escala engolidas por anel encolhendo -- FORA da
@@ -788,6 +861,107 @@ void animarAneis() {
     restaurarMarcasNaFaixa(restauraIni[i], restauraFim[i]);
   }
   restauraPendentes = 0;
+}
+
+// ---------------- VARREDURA DE BOOT (teste dos mostradores) ----------------
+// Assim que o splash termina de virar os aneis (ver plantarAneisEEncerrarTransicao),
+// antes de assentar no valor real recebido do PC, os dois aneis varrem ate o
+// maximo e voltam a zero -- igual ao "teste dos mostradores" que os painel de
+// carro fazem ao ligar a ignicao. Puramente cosmetico, acontece so' uma vez.
+// Reaproveita a MESMA fisica de mola de animarAneis(): so' muda o ALVO (fase
+// 1 = maximo, fase 2 = zero) e, no final, decide quando entregar o controle
+// de volta pros dados reais. (flags emVarreduraBoot/faseVarreduraBoot
+// declaradas la em cima, perto de mostrandoSplash/emTransicao -- ver
+// comentario por que.)
+void iniciarVarreduraBoot() {
+  emVarreduraBoot = true;
+  faseVarreduraBoot = 1;
+  grauCpuAlvo = grauGpuAlvo = (int)round(GAUGE_FIM);
+}
+
+// chamada com frequencia pelo loop() enquanto emVarreduraBoot == true, no
+// lugar de animarAneis() direto
+void animarVarreduraBoot() {
+  if (mostrandoMensagem) return;
+  bool cpuParado = fabs(velCpuAtual) < ANEL_PARADO_EPS && fabs(grauCpuAtualF - grauCpuAlvo) < ANEL_PARADO_EPS;
+  bool gpuParado = fabs(velGpuAtual) < ANEL_PARADO_EPS && fabs(grauGpuAtualF - grauGpuAlvo) < ANEL_PARADO_EPS;
+  if (!(cpuParado && gpuParado)) {
+    // mesma mecanica de animarAneis(), mas com as constantes BEM mais
+    // lentas da varredura (VARREDURA_RIGIDEZ/VARREDURA_AMORTECIMENTO) --
+    // por isso nao reaproveita animarAneis() direto, que usa as constantes
+    // normais (rapidas, pensadas pra responder aos dados reais do PC).
+    gfx->startWrite();
+    animarUmAnel(114, 8, grauCpuAtual, grauCpuAtualF, grauCpuAlvo, corCpuFixa, velCpuAtual, VARREDURA_RIGIDEZ, VARREDURA_AMORTECIMENTO);
+    animarUmAnel(94, 7, grauGpuAtual, grauGpuAtualF, grauGpuAlvo, corGpuFixa, velGpuAtual, VARREDURA_RIGIDEZ, VARREDURA_AMORTECIMENTO);
+    gfx->endWrite();
+
+    for (int i = 0; i < restauraPendentes; i++) {
+      restaurarMarcasNaFaixa(restauraIni[i], restauraFim[i]);
+    }
+    restauraPendentes = 0;
+  }
+
+  bool cpuChegou = fabs(velCpuAtual) < ANEL_PARADO_EPS && fabs(grauCpuAtualF - grauCpuAlvo) < ANEL_PARADO_EPS;
+  bool gpuChegou = fabs(velGpuAtual) < ANEL_PARADO_EPS && fabs(grauGpuAtualF - grauGpuAlvo) < ANEL_PARADO_EPS;
+  if (!(cpuChegou && gpuChegou)) return;
+
+  if (faseVarreduraBoot == 1) {
+    // chegou no maximo -- agora volta pro zero
+    faseVarreduraBoot = 2;
+    grauCpuAlvo = grauGpuAlvo = (int)round(GAUGE_INICIO);
+  } else if (faseVarreduraBoot == 2) {
+    // varredura terminou -- entrega o controle pro valor real (se ja
+    // chegou algum dado enquanto isso; senao o proximo pacote recebido
+    // cuida disso normalmente, via desenharPainel())
+    emVarreduraBoot = false;
+    faseVarreduraBoot = 0;
+    if (dados.cpuLoad >= 0) {
+      grauCpuAlvo = (int)round(GAUGE_INICIO + (dados.cpuLoad / 100.0) * (GAUGE_FIM - GAUGE_INICIO));
+    }
+    if (dados.gpuLoad >= 0) {
+      grauGpuAlvo = (int)round(GAUGE_INICIO + (dados.gpuLoad / 100.0) * (GAUGE_FIM - GAUGE_INICIO));
+    }
+
+    // redesenha a escala do zero AQUI, nesse exato instante em que os aneis
+    // estao parados em 0% (nada cobrindo nada) -- garante "0"/"50"/"100"
+    // de volta intactos. Necessario porque o CRESCIMENTO da varredura (indo
+    // ate o maximo) pinta por cima da posicao das marcas sem disparar a
+    // restauracao (so o ENCOLHIMENTO faz isso, ver animarUmAnel) -- como a
+    // varredura sempre atravessa a escala inteira (0->100->0, de proposito),
+    // essa lacuna fica bem mais visivel aqui do que no uso do dia a dia
+    // (onde a carga raramente varre a escala toda de ponta a ponta).
+    // Fora de qualquer startWrite()/endWrite() -- desenharEscala() usa
+    // drawLine/print, que abrem transacao SPI propria.
+    desenharEscala();
+  }
+}
+
+// ---------------- CORTINA DE TRANSICAO ENTRE TELAS ----------------
+// Ao trocar de tela (classica <-> personalizada, ou entre duas
+// personalizadas), em vez de um corte seco (fillScreen preto e redesenha
+// tudo no mesmo instante), uma cortina preta varre a tela da esquerda pra
+// direita cobrindo o conteudo antigo aos poucos. Quando termina de fechar
+// (tela 100% preta, igual ao fillScreen antigo), o conteudo novo e'
+// desenhado por cima -- os aneis ja crescem do zero ate o valor real
+// sozinhos (mesma fisica de mola de sempre), servindo de "abertura"
+// animada sem precisar de nenhum efeito extra. (flags emCortina/cortinaX e
+// a constante CORTINA_PASSO declaradas la em cima, perto de mostrandoSplash/
+// emTransicao -- ver comentario por que.)
+void iniciarCortina() {
+  emCortina = true;
+  cortinaX = 0;
+}
+
+// chamada com frequencia pelo loop() enquanto emCortina == true
+void animarCortina() {
+  if (cortinaX >= 240) {
+    emCortina = false;
+    desenharPainel(); // tela ja esta 100% preta -- desenha a pagina nova por cima
+    return;
+  }
+  int largura = min(CORTINA_PASSO, 240 - cortinaX);
+  gfx->fillRect(cortinaX, 0, largura, 240, 0x0000);
+  cortinaX += largura;
 }
 
 // tracinhos + numeros de referencia (0/50/100) por fora do anel de CPU --
@@ -865,10 +1039,17 @@ void aoTrocarDePagina() {
   Serial.printf("DBG:pagina trocou para %d\n", paginaAtual);
   for (int i = 0; i < 4; i++) linhasDesenhadas[i] = "";
   anelCustom1 = anelCustom2 = -1; // pagina nova comeca sem anel, ate o pacote DELA mandar R1/R2
-  if (mostrandoSplash || emTransicao) return;
-  gfx->fillScreen(0x0000);
   escalaDesenhada = false;
   aneisPrecisamRedesenho = true;
+  if (mostrandoSplash || emTransicao) return; // essas fases ja limpam tudo sozinhas ao terminar
+  if (emVarreduraBoot) {
+    // troca de tela no meio do "teste dos mostradores" do boot -- deixa a
+    // varredura terminar sozinha (ela ja chama desenharPainel() no final,
+    // que vai pegar a pagina nova certinha) em vez de misturar duas
+    // animacoes ao mesmo tempo
+    return;
+  }
+  iniciarCortina(); // cobre a tela antiga aos poucos, em vez de corte seco
 }
 
 // renderizador generico das telas personalizadas: mesma escala e mesmos
@@ -885,6 +1066,7 @@ void desenharPainelCustom() {
   if (aneisPrecisamRedesenho) {
     grauCpuAtual = grauCpuAlvo = (int)round(GAUGE_INICIO);
     grauGpuAtual = grauGpuAlvo = (int)round(GAUGE_INICIO);
+    grauCpuAtualF = grauGpuAtualF = GAUGE_INICIO;
     velCpuAtual = 0;
     velGpuAtual = 0;
     aneisPrecisamRedesenho = false;
@@ -949,6 +1131,7 @@ void desenharPainel() {
   if (aneisPrecisamRedesenho) {
     grauCpuAtual = grauCpuAlvo = (int)round(GAUGE_INICIO);
     grauGpuAtual = grauGpuAlvo = (int)round(GAUGE_INICIO);
+    grauCpuAtualF = grauGpuAtualF = GAUGE_INICIO;
     velCpuAtual = 0;
     velGpuAtual = 0;
     aneisPrecisamRedesenho = false;
