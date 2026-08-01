@@ -134,7 +134,7 @@ import atualizacao_engine
 # versao deste app -- comparada com a tag da release mais recente no
 # GitHub (ver atualizacao_engine.py) pra avisar quando tiver uma nova.
 # Suba isso a cada release publicada no repositorio.
-APP_VERSAO = "1.4.0"
+APP_VERSAO = "1.4.1"
 
 # ---------------------------------------------------------------------
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "PainelPC")
