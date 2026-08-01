@@ -47,7 +47,7 @@
 // Versao deste firmware -- reportada no boot (DBG:versao=...), aparece
 // na aba Firmware do app como "versao instalada". Formato livre
 // (major.minor.patch sugerido).
-#define FIRMWARE_VERSAO "1.3.1"
+#define FIRMWARE_VERSAO "1.4.0"
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_GC9A01A.h>
