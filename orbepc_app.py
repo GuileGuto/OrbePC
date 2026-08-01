@@ -134,7 +134,13 @@ import atualizacao_engine
 # versao deste app -- comparada com a tag da release mais recente no
 # GitHub (ver atualizacao_engine.py) pra avisar quando tiver uma nova.
 # Suba isso a cada release publicada no repositorio.
-APP_VERSAO = "1.4.1"
+APP_VERSAO = "1.4.2"
+
+# de quanto em quanto tempo o app re-confere se tem versao nova do app/
+# firmware no GitHub Releases, enquanto fica aberto (ver verificar_atualizacoes()
+# em main()). 15 min e' generoso o bastante pra nao estourar o limite de 60
+# requisicoes/hora sem autenticacao da API do GitHub (2 chamadas por ciclo).
+INTERVALO_VERIFICACAO_MS = 15 * 60 * 1000
 
 # ---------------------------------------------------------------------
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "PainelPC")
@@ -2281,14 +2287,6 @@ def main():
     # qualquer leitura de sensor (ver comentario em garantir_pawnio())
     garantir_pawnio()
 
-    # confere versao nova no GitHub Releases em segundo plano -- nunca
-    # bloqueia o startup, e simplesmente nao acontece nada se der erro
-    # (sem internet, repo sem releases ainda, etc, ver atualizacao_engine.py)
-    atualizacao_engine.verificar_async(
-        APP_VERSAO, lambda r: estado.atualizar(atualizacao_disponivel=r))
-    atualizacao_engine.buscar_firmware_disponivel_async(
-        lambda r: estado.atualizar(firmware_disponivel=r))
-
     import customtkinter as ctk
     ctk.set_appearance_mode("dark")  # inclusive a barra de titulo escura no Windows
 
@@ -2305,6 +2303,23 @@ def main():
 
     root = ctk.CTk()
     root.withdraw()  # a janela principal fica escondida -- so existe pra hospedar o mainloop
+
+    # confere versao nova no GitHub Releases (app e firmware) em segundo
+    # plano -- nunca bloqueia, e simplesmente nao acontece nada se der erro
+    # (sem internet, repo sem releases ainda, etc, ver atualizacao_engine.py).
+    # Reagenda-se sozinha a cada INTERVALO_VERIFICACAO_MS: sem isso, a
+    # checagem so rodava uma vez no startup e o app so descobria releases
+    # novas se fosse fechado e reaberto -- ruim pra quem deixa o app aberto
+    # dias seguidos. O intervalo e' generoso o bastante pra nao estourar o
+    # limite de requisicoes sem autenticacao da API do GitHub (60/h por IP).
+    def verificar_atualizacoes():
+        atualizacao_engine.verificar_async(
+            APP_VERSAO, lambda r: estado.atualizar(atualizacao_disponivel=r))
+        atualizacao_engine.buscar_firmware_disponivel_async(
+            lambda r: estado.atualizar(firmware_disponivel=r))
+        root.after(INTERVALO_VERIFICACAO_MS, verificar_atualizacoes)
+
+    verificar_atualizacoes()
 
     threading.Thread(target=montar_tray, args=(root, parar_evento), daemon=True).start()
 
