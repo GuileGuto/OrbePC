@@ -9,3 +9,8 @@ __pycache__/
 # arquivos de lock/temporarios do SolidWorks
 ~$*.SLDPRT
 ~$*.SLDASM
+
+# backups pessoais de configuracao exportados pela aba Geral do app --
+# dados locais do usuario, nao codigo-fonte, nao deveriam ir pro repo
+OrbePC_config_backup.json
+firmware_cache/

@@ -17,6 +17,15 @@ precisa ser esta pasta).
    Arduino-ESP32 que você usa tiver essa opção — é esse arquivo que o
    usuário vai selecionar no app (contém bootloader + tabela de partições
    + aplicativo já combinados, gravado inteiro no offset `0x0`).
-4. Distribua esse `.bin` pra quem for atualizar (e-mail, link, pendrive) —
-   a pessoa abre o OrbePC, vai na aba Firmware, clica em **Selecionar**,
-   escolhe o arquivo, e clica em **Aplicar**.
+4. Distribua esse `.bin` pra quem for atualizar. Duas formas:
+   - **Manual:** e-mail, link, pendrive — a pessoa abre o OrbePC, vai na
+     aba Firmware, clica em **Selecionar**, escolhe o arquivo, e clica em
+     **Aplicar**.
+   - **Automática (recomendado):** cria uma Release no GitHub
+     (`github.com/GuileGuto/OrbePC/releases/new`) com a tag no formato
+     **`firmware-vX.Y.Z`** (ex: `firmware-v1.2.0` — o prefixo `firmware-`
+     é obrigatório, é o que diferencia de uma release do app) e anexa o
+     `.bin`. O app confere isso sozinho no startup e mostra um aviso "Novo
+     firmware disponível" na própria aba Firmware, com botão **Baixar e
+     preparar** — baixa o `.bin` e já deixa selecionado, só falta clicar
+     em Aplicar. Ver `atualizacao_engine.py` pros detalhes.

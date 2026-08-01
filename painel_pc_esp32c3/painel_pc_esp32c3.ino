@@ -47,7 +47,7 @@
 // Versao deste firmware -- reportada no boot (DBG:versao=...), aparece
 // na aba Firmware do app como "versao instalada". Formato livre
 // (major.minor.patch sugerido).
-#define FIRMWARE_VERSAO "1.1.0"
+#define FIRMWARE_VERSAO "1.3.1"
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_GC9A01A.h>
@@ -426,6 +426,16 @@ void processarLinha(String linha) {
         else if (chave == "RAMPCT") dados.ramPct = valor;
         else if (chave == "VRAM") dados.vramUsadaGB = valor;
         else if (chave == "LIMITERAM") limiteRamPct = valor;
+        else if (chave == "REQVERSAO") {
+          // o app pergunta a versao em vez de so esperar o DBG:versao= do
+          // boot -- esse so sai UMA vez em setup(), e como o app abre a
+          // porta serial de proposito SEM resetar o ESP32 (pra nao voltar
+          // a ter o bug de tela recriando), ele nunca veria essa mensagem
+          // ao reconectar num ESP32 que ja estava ligado. Responder aqui,
+          // sob demanda, resolve isso -- o app so pergunta enquanto ainda
+          // nao sabe a versao (ver montar_linha() no orbepc_app.py).
+          Serial.printf("DBG:versao=%s\n", FIRMWARE_VERSAO);
+        }
         else if (chave == "BRIGHT") {
           // 0-100% vindo do app -- piso de 10% pra nunca deixar a tela
           // apagada de vez sem querer (ex: valor invalido/serial corrompida
@@ -436,6 +446,12 @@ void processarLinha(String linha) {
           if (pct > 100) pct = 100;
           int duty = (int)(pct * 255.0 / 100.0);
           if (duty != brilhoAtual) {
+            // log de diagnostico -- confirma no log.txt do app se o comando
+            // chegou e o duty realmente mudou, pra separar "nao chegou
+            // comando" de "chegou mas o pino nao faz diferenca no backlight
+            // fisico" (ver comentario de TFT_BL: algumas placas ligam o
+            // backlight direto no 3.3V, sem passar pelo GPIO)
+            Serial.printf("DBG:brilho mudou %d->%d (pedido %d%%)\n", brilhoAtual, duty, pct);
             brilhoAtual = duty;
             ledcWrite(TFT_BL, duty);
           }

@@ -134,7 +134,7 @@ import atualizacao_engine
 # versao deste app -- comparada com a tag da release mais recente no
 # GitHub (ver atualizacao_engine.py) pra avisar quando tiver uma nova.
 # Suba isso a cada release publicada no repositorio.
-APP_VERSAO = "1.0.0"
+APP_VERSAO = "1.4.0"
 
 # ---------------------------------------------------------------------
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "PainelPC")
@@ -523,6 +523,7 @@ class Estado:
         self.versao_firmware = None  # preenchida ao ler "DBG:versao=..." do ESP32
         self.pawnio_aviso = None  # preenchido por garantir_pawnio() se algo deu errado
         self.atualizacao_disponivel = None  # dict {"versao","url"} ou None -- ver atualizacao_engine
+        self.firmware_disponivel = None  # dict {"versao","url","nome_arquivo"} ou None -- ver atualizacao_engine
 
     def atualizar(self, **kwargs):
         with self.lock:
@@ -547,6 +548,7 @@ class Estado:
                 "versao_firmware": self.versao_firmware,
                 "pawnio_aviso": self.pawnio_aviso,
                 "atualizacao_disponivel": self.atualizacao_disponivel,
+                "firmware_disponivel": self.firmware_disponivel,
             }
 
 
@@ -671,6 +673,12 @@ def montar_linha(deteccao):
     partes.append(f"COLORGPU={config.get('colorGpu')}")
     partes.append(f"LIMITERAM={config.get('ramLimitPct'):.1f}")
     partes.append(f"BRIGHT={config.get('brilhoPct', 100.0):.0f}")
+    if estado.snapshot().get("versao_firmware") is None:
+        # ainda nao sabemos a versao do firmware conectado -- pergunta a
+        # cada pacote ate a resposta chegar (ver REQVERSAO no .ino). Para
+        # sozinho assim que thread_monitoramento capturar o DBG:versao=
+        # (nao fica perguntando pra sempre).
+        partes.append("REQVERSAO=1")
 
     return ";".join(partes) + "\n"
 
@@ -809,6 +817,12 @@ def montar_linha_pagina(deteccao, pagina):
     partes.append(f"COLORGPU={config.get('colorGpu')}")
     partes.append(f"LIMITERAM={config.get('ramLimitPct'):.1f}")
     partes.append(f"BRIGHT={config.get('brilhoPct', 100.0):.0f}")
+    if estado.snapshot().get("versao_firmware") is None:
+        # ainda nao sabemos a versao do firmware conectado -- pergunta a
+        # cada pacote ate a resposta chegar (ver REQVERSAO no .ino). Para
+        # sozinho assim que thread_monitoramento capturar o DBG:versao=
+        # (nao fica perguntando pra sempre).
+        partes.append("REQVERSAO=1")
     return ";".join(partes) + "\n"
 
 
@@ -1108,24 +1122,17 @@ def abrir_janela_configuracoes(master):
                      justify="left").pack(anchor="w", pady=(10, 0))
 
         # ----- brilho da tela -----
-        ctk.CTkLabel(esq, text="Brilho da tela", font=(FONTE, 15, "bold"),
-                     text_color=COR_TEXTO, anchor="w").pack(anchor="w", pady=(20, 10))
-
-        lbl_brilho = ctk.CTkLabel(esq, text=f"{int(config.get('brilhoPct', 100.0))}%",
-                                  font=(FONTE, 20, "bold"), text_color=COR_ACCENT)
-        lbl_brilho.pack(anchor="w")
-
-        def ao_mudar_brilho(v):
-            pct = round(float(v))
-            lbl_brilho.configure(text=f"{pct}%")
-            config.set("brilhoPct", float(pct))
-
-        escala_brilho = ctk.CTkSlider(esq, from_=10, to=100, number_of_steps=18,
-                                      command=ao_mudar_brilho, progress_color=COR_ACCENT,
-                                      button_color=COR_ACCENT, button_hover_color=COR_ACCENT_HOVER,
-                                      fg_color=COR_BORDA)
-        escala_brilho.set(config.get("brilhoPct", 100.0))
-        escala_brilho.pack(fill="x", pady=(6, 0))
+        # SEM SLIDER DE PROPOSITO: o modulo de display usado (GC9A01 redondo,
+        # so' RST/CS/DC/SDA/SCL/GND/VCC) nao expoe pino de backlight -- o
+        # LED fica ligado direto no VCC dentro da propria placinha da tela,
+        # sem trilha externa que de pra interceptar. Confirmado via log:
+        # o firmware recebe BRIGHT= e chama ledcWrite() certinho (linha
+        # "DBG:brilho mudou X->Y"), mas nao ha efeito fisico nenhum porque
+        # o pino nao esta de fato conectado ao backlight. O protocolo
+        # (BRIGHT= no montar_linha/montar_linha_pagina, config "brilhoPct")
+        # e o firmware (ledcAttach/ledcWrite em TFT_BL) continuam prontos e
+        # documentados -- se um dia trocar pra um modulo com pino BLK/LED
+        # exposto, so' add o slider de volta aqui, sem mexer no resto.
 
         dir_ = ctk.CTkFrame(f, fg_color="transparent")
         dir_.pack(side="right", padx=(0, 20), pady=14)
@@ -1919,6 +1926,55 @@ def abrir_janela_configuracoes(master):
                                      text_color=COR_TEXTO, anchor="w")
         lbl_instalada.pack(anchor="w", padx=14, pady=(12, 6))
 
+        # ----- aviso de firmware novo disponivel (GitHub Releases) -----
+        # escondido por padrao -- loop_atualizacao() (mais abaixo) decide
+        # quando mostrar, comparando com a versao do display CONECTADO
+        # agora (so se sabe isso depois que ele manda DBG:versao=)
+        card_fw_att = ctk.CTkFrame(interno, fg_color=COR_ACCENT_BG, corner_radius=10,
+                                   border_width=1, border_color=COR_ACCENT)
+        lbl_fw_att = ctk.CTkLabel(card_fw_att, text="", font=(FONTE, 12),
+                                  text_color=COR_ACCENT, anchor="w")
+        lbl_fw_att.pack(side="left", padx=14, pady=10)
+
+        def baixar_e_preparar_firmware():
+            info = estado.snapshot().get("firmware_disponivel")
+            if not info or not info.get("url"):
+                return
+            nome = info.get("nome_arquivo") or f"OrbePC_firmware_v{info['versao']}.bin"
+            destino = os.path.join(CONFIG_DIR, "firmware_cache", nome)
+
+            btn_baixar_fw.configure(state="disabled", text="Baixando…")
+            escrever_log(f"Baixando firmware v{info['versao']}...")
+
+            def callback_download(linha):
+                janela.after(0, lambda: escrever_log(linha))
+
+            def ao_terminar_download(erro):
+                def _ui():
+                    btn_baixar_fw.configure(state="normal", text="Baixar e preparar")
+                    if erro is None:
+                        estado_arquivo["caminho"] = destino
+                        lbl_arquivo.configure(text=os.path.basename(destino), text_color=COR_TEXTO)
+                        btn_aplicar.configure(state="normal")
+                        escrever_log("✔ Firmware baixado e pronto -- clique em Aplicar quando quiser gravar.")
+                    else:
+                        escrever_log(f"✘ Falha ao baixar firmware: {erro}")
+                janela.after(0, _ui)
+
+            atualizacao_engine.baixar_arquivo_async(
+                info["url"], destino, callback=callback_download, ao_terminar=ao_terminar_download)
+
+        btn_baixar_fw = ctk.CTkButton(card_fw_att, text="Baixar e preparar", command=baixar_e_preparar_firmware,
+                                      fg_color=COR_ACCENT, hover_color=COR_ACCENT_HOVER,
+                                      text_color="#1a1a1a", font=(FONTE, 11, "bold"),
+                                      corner_radius=8, height=28, width=140)
+        btn_baixar_fw.pack(side="right", padx=14)
+
+        firmware_ui["card_att"] = card_fw_att
+        firmware_ui["label_att"] = lbl_fw_att
+        firmware_ui["ancora_att"] = card
+        firmware_ui["mostrado_att"] = False
+
         # ----- selecao manual do arquivo .bin -----
         estado_arquivo = {"caminho": None}
 
@@ -2088,6 +2144,26 @@ def abrir_janela_configuracoes(master):
                 elif not info and atualizacao_ui["mostrado"]:
                     atualizacao_ui["card"].pack_forget()
                     atualizacao_ui["mostrado"] = False
+
+            if "card_att" in firmware_ui:
+                fw_info = snap.get("firmware_disponivel")
+                versao_conectada = snap.get("versao_firmware")
+                # so mostra o aviso se: tem release de firmware achada E
+                # (nao sabemos a versao conectada ainda, OU ela e' mais
+                # velha que a disponivel) -- sem isso, avisaria pra sempre
+                # mesmo com o display ja atualizado
+                deve_mostrar = bool(fw_info) and (
+                    versao_conectada is None
+                    or atualizacao_engine.eh_mais_nova(fw_info["versao"], versao_conectada)
+                )
+                if deve_mostrar and not firmware_ui["mostrado_att"]:
+                    firmware_ui["label_att"].configure(
+                        text=f"Novo firmware disponível: v{fw_info['versao']}")
+                    firmware_ui["card_att"].pack(fill="x", pady=(0, 12), before=firmware_ui["ancora_att"])
+                    firmware_ui["mostrado_att"] = True
+                elif not deve_mostrar and firmware_ui["mostrado_att"]:
+                    firmware_ui["card_att"].pack_forget()
+                    firmware_ui["mostrado_att"] = False
             janela.after(1000, loop_atualizacao)
         except Exception:
             pass  # janela fechada no meio do caminho
@@ -2210,6 +2286,8 @@ def main():
     # (sem internet, repo sem releases ainda, etc, ver atualizacao_engine.py)
     atualizacao_engine.verificar_async(
         APP_VERSAO, lambda r: estado.atualizar(atualizacao_disponivel=r))
+    atualizacao_engine.buscar_firmware_disponivel_async(
+        lambda r: estado.atualizar(firmware_disponivel=r))
 
     import customtkinter as ctk
     ctk.set_appearance_mode("dark")  # inclusive a barra de titulo escura no Windows
