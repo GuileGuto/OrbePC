@@ -7,9 +7,9 @@ os dados pro ESP32 via USB Serial, mas agora com:
   - janela de configuracoes moderna (CustomTkinter): sidebar com paginas
     Metricas (cores + preview ao vivo do display), Telas (personalizadas),
     Sensores, Alertas e Geral
-  - telas personalizadas: alem da tela classica, o usuario cria ate
-    MAX_TELAS_CUSTOM telas extras (aneis + linhas escolhiveis), com
-    rotacao automatica e "Proxima tela" na bandeja
+  - telas totalmente editaveis (aneis + linhas escolhiveis, ate
+    MAX_TELAS no total): qualquer uma pode virar a "Principal" (mostrada
+    por padrao), com rotacao automatica e "Proxima tela" na bandeja
   - deteccao de sensores em camadas (sensor_engine.py), resiliente a
     CPU/GPU de fabricantes diferentes -- veja sensor_engine.py pros
     detalhes de como isso funciona
@@ -159,10 +159,16 @@ CONFIG_PADRAO = {
     "updateIntervalSec": 1.0,
     "autostart": False,
     "sensorOverrides": {},
-    # telas personalizadas: ate MAX_TELAS_CUSTOM dicts no formato
+    # todas as telas, EM ORDEM -- a de indice 0 e' a "Principal" (mostrada
+    # por padrao / pagina 0). Qualquer tela pode virar a Principal (botao
+    # "Tornar Principal" na aba Telas so' reordena a lista, nao muda o
+    # conteudo de nenhuma). Sempre tem pelo menos 1 -- nao da pra ficar sem
+    # nenhuma tela (ver remover_tela() na UI). O valor padrao abaixo
+    # reproduz o visual classico de sempre (aneis de uso de CPU/GPU,
+    # temperaturas + RAM/VRAM). Formato de cada item:
     # {"anel1": id|None, "anel2": id|None, "linhas": [id|None x4]}
-    # (a tela 1, classica, e fixa e nao entra aqui)
-    "telasCustom": [],
+    "telas": [{"anel1": "cpuLoad", "anel2": "gpuLoad",
+               "linhas": ["cpuTemp", "gpuTemp", "ram", "vram"]}],
     "rotacaoSec": 0,  # troca automatica de tela a cada N segundos (0 = desligada)
     "atalhoTela": "",  # atalho global de teclado pra trocar de tela (ex: "ctrl+alt+n"; "" = desligado)
     # clima (Open-Meteo): cidade escolhida na aba Geral
@@ -219,6 +225,22 @@ class Config:
             pass
         except Exception:
             log("Erro ao carregar config, usando padrao:\n" + traceback.format_exc())
+        self._migrar_telas()
+
+    def _migrar_telas(self):
+        """Config salva por uma versao anterior (que tinha "telaPrincipal"
+        + "telasCustom" separados, antes de virar uma so lista "telas"
+        reordenavel) -- junta os dois numa lista so na primeira vez que
+        abrir com uma config antiga, sem perder nada, e salva ja migrado."""
+        precisa_salvar = False
+        with self._lock:
+            if "telaPrincipal" in self._dados or "telasCustom" in self._dados:
+                principal = self._dados.pop("telaPrincipal", None) or CONFIG_PADRAO["telas"][0]
+                extras = self._dados.pop("telasCustom", None) or []
+                self._dados["telas"] = [principal] + extras
+                precisa_salvar = True
+        if precisa_salvar:
+            self.salvar()
 
     def salvar(self):
         try:
@@ -524,6 +546,7 @@ class Estado:
         self.porta = None
         self.pagina = 0
         self.trocar_tela = False  # pedido manual de "Proxima tela" (bandeja)
+        self.pedido_pagina = None  # int = "pula direto pra essa pagina" (aba Telas); None = sem pedido
         self.ultima_deteccao = {}
         self.ultimo_erro = None
         self.versao_firmware = None  # preenchida ao ler "DBG:versao=..." do ESP32
@@ -540,6 +563,12 @@ class Estado:
         with self.lock:
             pedido = self.trocar_tela
             self.trocar_tela = False
+            return pedido
+
+    def consumir_pedido_pagina(self):
+        with self.lock:
+            pedido = self.pedido_pagina
+            self.pedido_pagina = None
             return pedido
 
     def snapshot(self):
@@ -660,55 +689,58 @@ atalho_global = AtalhoGlobal(lambda: estado.atualizar(trocar_tela=True))
 
 
 # ---------------------------------------------------------------------
-# MONTAGEM DA LINHA SERIAL
+# TELAS -- todas usam o mesmo formato generico: 2 aneis (metricas em %) e
+# 4 linhas de texto, escolhidas na aba "Telas". A tela de INDICE 0 na
+# lista e' a "Principal" (mostrada por padrao / pagina 0) -- qualquer tela
+# pode virar a Principal (botao "Tornar Principal" so reordena a lista).
+# O firmware nao sabe o que esta mostrando: recebe PAGE=n + R1/R2 (aneis)
+# + L1..L4 (textos ja formatados aqui) + IC1..4/AL1..4 (icone de
+# termometro / alerta vermelho, por linha) e so desenha -- ver
+# montar_corpo_tela() mais abaixo.
 # ---------------------------------------------------------------------
-def montar_linha(deteccao):
-    mapa = [
-        ("cpuTemp", "CPU"), ("cpuLoad", "CPULOAD"),
-        ("gpuTemp", "GPU"), ("gpuLoad", "GPULOAD"),
-        ("cpuClock", "CLK"), ("ram", "RAM"),
-        ("ramPct", "RAMPCT"), ("vram", "VRAM"),
-    ]
-    partes = []
-    for chave, tag in mapa:
-        v = deteccao.get(chave, {}).get("valor")
-        if v is not None:
-            partes.append(f"{tag}={v:.1f}")
-
-    partes.append(f"COLORCPU={config.get('colorCpu')}")
-    partes.append(f"COLORGPU={config.get('colorGpu')}")
-    partes.append(f"LIMITERAM={config.get('ramLimitPct'):.1f}")
-    partes.append(f"BRIGHT={config.get('brilhoPct', 100.0):.0f}")
-    if estado.snapshot().get("versao_firmware") is None:
-        # ainda nao sabemos a versao do firmware conectado -- pergunta a
-        # cada pacote ate a resposta chegar (ver REQVERSAO no .ino). Para
-        # sozinho assim que thread_monitoramento capturar o DBG:versao=
-        # (nao fica perguntando pra sempre).
-        partes.append("REQVERSAO=1")
-
-    return ";".join(partes) + "\n"
-
-
-# ---------------------------------------------------------------------
-# TELAS PERSONALIZADAS -- alem da tela classica (fixa), o usuario cria
-# ate MAX_TELAS_CUSTOM telas extras, cada uma com 2 aneis (metricas em %)
-# e 4 linhas de texto, escolhidas na aba "Telas". O firmware nao sabe o
-# que esta mostrando: recebe PAGE=n + R1/R2 (aneis) + L1..L4 (textos ja
-# formatados aqui) e so desenha.
-# ---------------------------------------------------------------------
-MAX_TELAS_CUSTOM = 5  # + a tela classica = 6; acima disso a rotacao vira carrossel confuso
+MAX_TELAS = 6  # acima disso a rotacao vira carrossel confuso
 
 
 def _tela_tem_conteudo(tela):
     return bool(tela.get("anel1") or tela.get("anel2") or any(tela.get("linhas") or []))
 
 
+def telas_todas():
+    """Lista completa na ordem atual -- indice 0 e' a Principal. Sempre
+    tem pelo menos 1 (ver CONFIG_PADRAO/_migrar_telas/remover_tela)."""
+    ts = config.get("telas") or []
+    return list(ts) if ts else [dict(CONFIG_PADRAO["telas"][0])]
+
+
 def telas_ativas():
-    """Somente telas custom com pelo menos uma vaga preenchida. Tela
+    """Telas que entram na ROTACAO: a Principal (indice 0) SEMPRE entra,
+    mesmo vazia -- e' a tela padrao, tem que ter uma pra mostrar. As
+    demais so contam se tiverem pelo menos uma vaga preenchida -- tela
     recem-criada (ainda toda vazia) NAO entra na rotacao nem no "Proxima
-    tela" -- senao o display alterna pra uma tela "quebrada" so com a
+    tela", senao o display alternaria pra uma tela "quebrada" so com a
     escala e o OrbePC, parecendo bug (aconteceu na v1 do recurso)."""
-    return [t for t in (config.get("telasCustom") or []) if _tela_tem_conteudo(t)]
+    todas = telas_todas()
+    return [todas[0]] + [t for t in todas[1:] if _tela_tem_conteudo(t)]
+
+
+def pagina_da_tela(idx_todas):
+    """Converte um indice de telas_todas() (o que a aba Telas usa pra
+    editar) no indice de PAGINA correspondente em telas_ativas() (o que o
+    protocolo PAGE= realmente manda pro display) -- None se essa tela nao
+    esta ativa (vazia, e nao e' a Principal). Usado pelo seletor da aba
+    Telas pra pular o display direto pra tela escolhida."""
+    todas = telas_todas()
+    if not (0 <= idx_todas < len(todas)):
+        return None
+    if idx_todas == 0:
+        return 0  # Principal sempre ativa, sempre pagina 0
+    if not _tela_tem_conteudo(todas[idx_todas]):
+        return None  # tela vazia nao aparece no display, nada pra pular
+    pagina = 1
+    for t in todas[1:idx_todas]:
+        if _tela_tem_conteudo(t):
+            pagina += 1
+    return pagina
 
 
 # metricas que podem alimentar os ANEIS (precisam ser 0-100%)
@@ -750,6 +782,11 @@ METRICAS_LINHA = {
     "climaUmid":  ("Clima · umidade",     None),
 }
 
+# metricas de LINHA que ganham o iconzinho de termometro (ver IC1..4 no
+# protocolo, montar_corpo_tela()) -- vale pra QUALQUER tela, nao so a
+# Principal, ja que agora todas usam o mesmo mecanismo generico.
+METRICAS_TEMPERATURA = {"cpuTemp", "gpuTemp", "discoTemp", "climaTemp"}
+
 
 def _valor_metrica_local(metrica_id):
     """Metricas que nao vem de sensor nenhum -- calculadas na hora."""
@@ -786,16 +823,17 @@ def _sanitizar_linha(texto):
     return texto.replace(";", ",").replace("=", ":")
 
 
-def montar_linha_pagina(deteccao, pagina):
-    """Monta a linha serial da pagina atual: PAGE=0 e a tela classica
-    (protocolo antigo intacto), PAGE>=1 sao as telas personalizadas
-    ATIVAS (as vazias ficam de fora -- ver telas_ativas())."""
-    telas = telas_ativas()
-    if pagina <= 0 or pagina > len(telas):
-        return "PAGE=0;" + montar_linha(deteccao)
+def tela_principal():
+    return telas_todas()[0]
 
-    tela = telas[pagina - 1]
-    partes = [f"PAGE={pagina}"]
+
+def montar_corpo_tela(tela, deteccao):
+    """R1/R2 (aneis) + L1..L4 (texto) + IC1..4 (icone de termometro) +
+    AL1..4 (alerta vermelho, hoje so' pra RAM acima do limite) -- formato
+    generico usado por QUALQUER tela (Principal ou personalizada). O
+    firmware so' desenha o que chega aqui, sem saber a diferenca entre
+    elas."""
+    partes = []
 
     def v(mid):
         return deteccao.get(mid, {}).get("valor") if mid else None
@@ -805,7 +843,10 @@ def montar_linha_pagina(deteccao, pagina):
         if val is not None:
             partes.append(f"{tag}={val:.1f}")
 
+    ram_pct = v("ramPct")
+    limite = config.get("ramLimitPct")
     linhas = (tela.get("linhas") or [None] * 4)[:4]
+    linhas += [None] * (4 - len(linhas))
     for i, mid in enumerate(linhas, start=1):
         texto = ""
         if mid:
@@ -819,9 +860,29 @@ def montar_linha_pagina(deteccao, pagina):
                     texto = entrada[1](val)
         partes.append(f"L{i}={_sanitizar_linha(texto)}")
 
+        if mid in METRICAS_TEMPERATURA:
+            partes.append(f"IC{i}=1")
+        if mid in ("ram", "ramPct") and ram_pct is not None and limite is not None and ram_pct >= limite:
+            partes.append(f"AL{i}=1")
+
+    return partes
+
+
+def montar_linha_pagina(deteccao, pagina):
+    """Monta a linha serial da pagina atual -- pagina indexa direto em
+    telas_ativas() (0 = Principal, sempre presente; 1+ = as demais ativas,
+    ver telas_ativas()). Pagina fora do range (ex: usuario removeu uma
+    tela enquanto o display estava nela) cai de volta na Principal."""
+    telas = telas_ativas()
+    if pagina < 0 or pagina >= len(telas):
+        pagina_efetiva, tela = 0, telas[0]
+    else:
+        pagina_efetiva, tela = pagina, telas[pagina]
+
+    partes = [f"PAGE={pagina_efetiva}"] + montar_corpo_tela(tela, deteccao)
+
     partes.append(f"COLORCPU={config.get('colorCpu')}")
     partes.append(f"COLORGPU={config.get('colorGpu')}")
-    partes.append(f"LIMITERAM={config.get('ramLimitPct'):.1f}")
     partes.append(f"BRIGHT={config.get('brilhoPct', 100.0):.0f}")
     if estado.snapshot().get("versao_firmware") is None:
         # ainda nao sabemos a versao do firmware conectado -- pergunta a
@@ -961,12 +1022,18 @@ def thread_monitoramento(parar_evento):
                                 "(provavel SMART de disco lento -- se o display recriar a tela, e isso)")
                         estado.atualizar(ultima_deteccao=deteccao, ultimo_erro=None)
 
-                        # qual tela mostrar: troca manual (bandeja) tem
-                        # prioridade; senao, rotacao automatica por tempo.
-                        # So telas com conteudo contam -- vazia nao roda.
-                        num_telas = 1 + len(telas_ativas())
+                        # qual tela mostrar: pedido direto (seletor da aba
+                        # Telas) tem prioridade maxima, depois troca manual
+                        # (bandeja), depois rotacao automatica por tempo.
+                        # So telas com conteudo contam -- vazia nao roda
+                        # (exceto a Principal, indice 0, que sempre conta).
+                        num_telas = len(telas_ativas())
                         rotacao = config.get("rotacaoSec", 0) or 0
-                        if estado.consumir_troca_manual():
+                        pedido_pagina = estado.consumir_pedido_pagina()
+                        if pedido_pagina is not None:
+                            pagina = pedido_pagina % num_telas
+                            ultimo_giro = time.time()
+                        elif estado.consumir_troca_manual():
                             pagina = (pagina + 1) % num_telas
                             ultimo_giro = time.time()
                         elif (rotacao > 0 and num_telas > 1
@@ -1738,10 +1805,15 @@ def abrir_janela_configuracoes(master):
         opcoes_linha = [VAZIO] + [e[0] for e in METRICAS_LINHA.values()]
 
         def telas():
-            return list(config.get("telasCustom") or [])
+            return telas_todas()  # lista completa e' o q se edita aqui -- indice 0 = Principal
 
+        # a tela de indice 0 e' sempre a "Principal" (mostrada por padrao),
+        # e isso aparece so' no ROTULO -- qualquer tela pode assumir essa
+        # posicao via "Tornar Principal" (tornar_principal(), mais abaixo),
+        # que so reordena a lista, sem mudar o conteudo de nenhuma tela.
         def nomes_telas():
-            return [f"Tela {i + 2}" for i in range(len(telas()))]
+            return [f"Tela {i + 1}" + (" (Principal)" if i == 0 else "")
+                    for i in range(len(telas()))]
 
         estado_aba = {"idx": 0}
 
@@ -1771,13 +1843,13 @@ def abrir_janela_configuracoes(master):
         barra = ctk.CTkFrame(interno, fg_color="transparent")
         barra.pack(fill="x", pady=(0, 6))
 
-        seletor = ctk.CTkOptionMenu(barra, values=nomes_telas() or [VAZIO],
+        seletor = ctk.CTkOptionMenu(barra, values=nomes_telas(),
                                     fg_color="#262626", button_color="#303030",
                                     button_hover_color=COR_ACCENT, text_color=COR_TEXTO,
                                     font=(FONTE, 12), dropdown_fg_color=COR_FUNDO_CARD,
                                     dropdown_text_color=COR_TEXTO,
                                     dropdown_hover_color=COR_ACCENT_BG,
-                                    width=110, height=28,
+                                    width=150, height=28,
                                     command=lambda nome: selecionar(nome))
         seletor.pack(side="left")
 
@@ -1785,22 +1857,28 @@ def abrir_janela_configuracoes(master):
         area_config.pack(fill="both", expand=True, pady=(4, 0))
 
         def salvar_telas(novas):
-            config.set("telasCustom", novas)
+            config.set("telas", novas)
 
         def atualizar_seletor():
-            nomes = nomes_telas()
-            seletor.configure(values=nomes or [VAZIO])
-            if nomes:
-                estado_aba["idx"] = min(estado_aba["idx"], len(nomes) - 1)
-                seletor.set(nomes[estado_aba["idx"]])
-            else:
-                seletor.set(VAZIO)
+            nomes = nomes_telas()  # nunca vazio -- sempre tem pelo menos 1 tela
+            seletor.configure(values=nomes)
+            estado_aba["idx"] = min(estado_aba["idx"], len(nomes) - 1)
+            seletor.set(nomes[estado_aba["idx"]])
 
         def selecionar(nome):
             try:
-                estado_aba["idx"] = int(nome.split()[-1]) - 2
+                estado_aba["idx"] = int(nome.split()[1]) - 1
             except (ValueError, IndexError):
                 estado_aba["idx"] = 0
+            # escolher uma tela aqui ja manda o display pra ela direto --
+            # elimina o botao "Passar tela" separado. Tela vazia (ainda sem
+            # nenhum anel/linha configurado) nao tem o que mostrar, entao
+            # so avisa e deixa o display onde estava.
+            pagina_alvo = pagina_da_tela(estado_aba["idx"])
+            if pagina_alvo is not None:
+                estado.atualizar(pedido_pagina=pagina_alvo)
+            else:
+                lbl_rot.configure(text="Essa tela está vazia -- configure algo antes de mostrar no display.")
             montar_config_tela()
 
         def linha_escolha(parent, rotulo, valor_id, mapa_por_rotulo, opcoes, ao_definir):
@@ -1832,25 +1910,21 @@ def abrir_janela_configuracoes(master):
                 w.destroy()
 
             ts = telas()
-            if not ts:
-                ctk.CTkLabel(area_config,
-                             text="Nenhuma tela personalizada ainda.\nClique em \"+ Nova tela\" pra criar a primeira —\nvocê escolhe o que aparece em cada anel e linha.",
-                             font=(FONTE, 11), text_color=COR_TEXTO_MUTED,
-                             justify="left").pack(anchor="w", pady=8)
-                return
-
-            i = estado_aba["idx"]
-            tela = ts[i]
+            idx = min(estado_aba["idx"], len(ts) - 1)
+            estado_aba["idx"] = idx
+            tela = ts[idx]
 
             def definir(chave, valor, indice_linha=None):
                 ts2 = telas()
+                if idx >= len(ts2):
+                    return  # estado momentaneamente inconsistente (ex: acabou de remover)
                 if indice_linha is None:
-                    ts2[i][chave] = valor
+                    ts2[idx][chave] = valor
                 else:
-                    linhas = (ts2[i].get("linhas") or [None] * 4)[:4]
+                    linhas = (ts2[idx].get("linhas") or [None] * 4)[:4]
                     linhas += [None] * (4 - len(linhas))
                     linhas[indice_linha] = valor
-                    ts2[i]["linhas"] = linhas
+                    ts2[idx]["linhas"] = linhas
                 salvar_telas(ts2)
 
             linha_escolha(area_config, "Anel externo", tela.get("anel1"),
@@ -1866,8 +1940,8 @@ def abrir_janela_configuracoes(master):
 
         def adicionar_tela():
             ts = telas()
-            if len(ts) >= MAX_TELAS_CUSTOM:
-                lbl_rot.configure(text=f"Limite de {MAX_TELAS_CUSTOM} telas personalizadas atingido")
+            if len(ts) >= MAX_TELAS:
+                lbl_rot.configure(text=f"Limite de {MAX_TELAS} telas atingido")
                 return
             ts.append({"anel1": None, "anel2": None, "linhas": [None] * 4})
             salvar_telas(ts)
@@ -1877,11 +1951,24 @@ def abrir_janela_configuracoes(master):
 
         def remover_tela():
             ts = telas()
-            if not ts:
+            if len(ts) <= 1:
+                lbl_rot.configure(text="Precisa sobrar pelo menos uma tela.")
                 return
             ts.pop(estado_aba["idx"])
             salvar_telas(ts)
             estado_aba["idx"] = max(0, min(estado_aba["idx"], len(ts) - 1))
+            atualizar_seletor()
+            montar_config_tela()
+
+        def tornar_principal():
+            if estado_aba["idx"] == 0:
+                lbl_rot.configure(text="Essa tela já é a Principal.")
+                return
+            ts = telas()
+            tela = ts.pop(estado_aba["idx"])
+            ts.insert(0, tela)
+            salvar_telas(ts)
+            estado_aba["idx"] = 0
             atualizar_seletor()
             montar_config_tela()
 
@@ -1894,18 +1981,14 @@ def abrir_janela_configuracoes(master):
                       text_color=COR_TEXTO_MUTED, font=(FONTE, 11),
                       border_width=1, border_color=COR_BORDA,
                       corner_radius=8, height=28, width=80).pack(side="left", padx=(6, 0))
-
-        # passa o display pra proxima tela daqui tambem (mesmo comando do
-        # "Proxima tela" da bandeja -- a thread de monitoramento consome
-        # o pedido no proximo ciclo, ~1s)
-        def passar_tela():
-            estado.atualizar(trocar_tela=True)
-
-        ctk.CTkButton(barra, text="Passar tela ▸", command=passar_tela,
+        ctk.CTkButton(barra, text="★ Tornar Principal", command=tornar_principal,
                       fg_color="transparent", hover_color=COR_HOVER_NAV,
-                      text_color=COR_ACCENT, font=(FONTE, 11),
-                      border_width=1, border_color=COR_ACCENT,
-                      corner_radius=8, height=28, width=100).pack(side="right")
+                      text_color=COR_TEXTO_MUTED, font=(FONTE, 11),
+                      border_width=1, border_color=COR_BORDA,
+                      corner_radius=8, height=28, width=140).pack(side="left", padx=(6, 0))
+
+        # (o botao "Passar tela" separado saiu -- agora e' so escolher a
+        # tela no seletor acima, que ja manda o display pra ela direto)
 
         atualizar_seletor()
         montar_config_tela()

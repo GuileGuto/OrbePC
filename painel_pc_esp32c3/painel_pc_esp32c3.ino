@@ -47,7 +47,7 @@
 // Versao deste firmware -- reportada no boot (DBG:versao=...), aparece
 // na aba Firmware do app como "versao instalada". Formato livre
 // (major.minor.patch sugerido).
-#define FIRMWARE_VERSAO "1.5.2"
+#define FIRMWARE_VERSAO "2.0.0"
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_GC9A01A.h>
@@ -71,65 +71,26 @@
 Adafruit_GC9A01A *gfx = new Adafruit_GC9A01A(&SPI, TFT_DC, TFT_CS, TFT_RST);
 
 // ---------------- DADOS RECEBIDOS ----------------
-struct Sensores {
-  float cpuTemp = -1, gpuTemp = -1;
-  float cpuLoad = -1, gpuLoad = -1;
-  float cpuClockMHz = -1;
-  float ramUsadaGB = -1;
-  float ramPct = -1;
-  float vramUsadaGB = -1;
-} dados;
+// Ate a v1.5.x, a tela Principal (pagina 0) era um caso especial: recebia
+// numeros brutos (CPU=, GPU=, CPULOAD=, etc) e formatava/filtrava tudo
+// aqui dentro (struct Sensores + filtro de ruido de temperatura). Agora
+// TODAS as telas (Principal inclusive) usam o mesmo formato generico
+// R1/R2 + L1..L4 ja formatado pelo app (ver anelCustom1/2, linhasCustom[]
+// mais abaixo) -- o firmware nao faz mais ideia de onde cada numero veio,
+// so desenha. Isso tambem tira o firmware do jogo de "filtrar ruido de
+// sensor": a deteccao no app (sensor_engine.py) ja faz esse trabalho.
 
-// filtro de rejeicao de ruido nas temperaturas de CPU/GPU. A media movel
-// simples nao funcionou bem: um unico valor esdruxulo (ex: "6" com o PC a
-// 70C) entrava direto na conta e derrubava a media junto com os valores
-// bons. A ideia agora e diferente -- um salto grande demais entre uma
-// leitura e a proxima (mais do que qualquer CPU/GPU real mudaria de
-// temperatura entre duas leituras, ~0.5s) e tratado como ruido e
-// simplesmente DESCARTADO (mantem o ultimo valor bom na tela), a nao ser
-// que o MESMO salto se repita (aí confirma que era uma mudanca real, tipo
-// o PC realmente esfriando rapido, e nao um pico isolado do sensor).
-const float SALTO_MAX_TEMP = 15.0; // graus, acima disso e suspeito
-
-struct FiltroTemp {
-  float valor = -1;     // ultimo valor confirmado (mostrado na tela)
-  float candidato = -1; // valor suspeito aguardando confirmacao
-  int repeticoes = 0;
-};
-
-FiltroTemp filtroCpuTemp, filtroGpuTemp;
-
-float filtrarTemp(FiltroTemp &f, float novo) {
-  if (f.valor < 0) { // primeira leitura -- aceita direto, nao ha com o que comparar
-    f.valor = novo;
-    return f.valor;
-  }
-
-  if (fabs(novo - f.valor) <= SALTO_MAX_TEMP) {
-    // variacao normal, aceita e esquece qualquer candidato pendente
-    f.valor = novo;
-    f.candidato = -1;
-    f.repeticoes = 0;
-    return f.valor;
-  }
-
-  // salto grande -- so aceita se o MESMO valor aparecer de novo em seguida
-  // (confirma que nao foi um pico passageiro do sensor)
-  if (f.candidato >= 0 && fabs(novo - f.candidato) <= 2.0) {
-    f.repeticoes++;
-  } else {
-    f.candidato = novo;
-    f.repeticoes = 1;
-  }
-
-  if (f.repeticoes >= 2) {
-    f.valor = novo;
-    f.candidato = -1;
-    f.repeticoes = 0;
-  }
-  // enquanto nao confirmado, mantem o ultimo valor bom
-  return f.valor;
-}
+// ---------------- PISCA DE ALERTA / ICONE DAS TELAS ----------------
+// Sinalizadores por LINHA (L1..L4), mandados pelo app junto de cada
+// pacote (IC1..4 = mostra icone de termometro, AL1..4 = pinta a linha de
+// vermelho -- hoje usado pra RAM acima do limite, mas serve pra qualquer
+// alerta futuro). Ao contrario de R1/R2 (que so mudam quando o pacote
+// TEM o valor), esses dois são reafirmados em TODO pacote -- ausencia
+// significa "desligado" (ver processarLinha()).
+bool iconeLinha[4] = {false, false, false, false};
+bool alertaLinha[4] = {false, false, false, false};
+bool iconeDesenhado[4] = {false, false, false, false};  // ultimo estado DESENHADO -- pra saber quando precisa limpar/redesenhar
+bool alertaDesenhado[4] = {false, false, false, false}; // idem, pro alerta vermelho
 
 // converte uma string hex tipo "1D9E75" (sem #) num uint16_t no formato
 // RGB565 que a lib grafica usa. Se vier algo invalido/curto demais,
@@ -166,7 +127,6 @@ const unsigned long TIMEOUT_SEM_DADOS = 8000; // ms
 const int CX = 120, CY = 120; // centro do display 240x240
 bool mostrandoMensagem = false; // true enquanto uma mensagem de status ocupa a tela
 uint16_t corCpuFixa, corGpuFixa, corLaranjaFixa; // cores definidas no setup(), ajustaveis via serial (COLORCPU/COLORGPU)
-float limiteRamPct = 90.0; // % a partir do qual o numero de RAM fica vermelho, ajustavel via LIMITERAM
 bool precisaRedesenhoTotal = false; // true quando uma cor muda -- forca redesenho limpo dos aneis na nova cor
 
 // ---------------- BRILHO DA TELA (backlight em PWM) ----------------
@@ -408,6 +368,12 @@ void processarLinha(String linha) {
   // R1/R2 em telas sem anel, e sem esse cuidado o valor da tela
   // anterior ficava "grudado" (anel fantasma congelado na tela nova)
   float r1Pacote = -1, r2Pacote = -1;
+  // icone de termometro (IC1..4) e alerta vermelho (AL1..4) por linha --
+  // ao contrario de R1/R2, o app reafirma os dois em TODO pacote, entao
+  // aqui comeca "tudo desligado" e so liga o que estiver presente NESTE
+  // pacote (ausencia = desligado, nao "mantem o que tinha antes").
+  bool iconePacote[4] = {false, false, false, false};
+  bool alertaPacote[4] = {false, false, false, false};
 
   int inicio = 0;
   while (inicio < (int)linha.length()) {
@@ -456,27 +422,18 @@ void processarLinha(String linha) {
         valorStr.replace('~', (char)248);
         linhasCustom[idx] = valorStr;
         if (valorStr.length() > 0) conteudoCustomNoPacote = true;
+      } else if (chave.length() == 3 && chave.charAt(0) == 'I' && chave.charAt(1) == 'C'
+                 && chave.charAt(2) >= '1' && chave.charAt(2) <= '4') {
+        iconePacote[chave.charAt(2) - '1'] = (valorStr.toInt() != 0);
+      } else if (chave.length() == 3 && chave.charAt(0) == 'A' && chave.charAt(1) == 'L'
+                 && chave.charAt(2) >= '1' && chave.charAt(2) <= '4') {
+        alertaPacote[chave.charAt(2) - '1'] = (valorStr.toInt() != 0);
       } else {
         float valor = valorStr.toFloat();
 
-        // ignora leitura de temperatura zerada (ou negativa) -- normalmente
-        // e ruido/corte no dado (ex: linha serial corrompida virando "0" no
-        // toFloat(), ou instante de atualizacao do sensor) e nao uma
-        // temperatura real. O filtro no app ja tenta barrar isso na
-        // origem, mas aqui e uma segunda trava direto no ESP32: se vier
-        // zerado, simplesmente mantem o ultimo valor valido na tela.
-        if (chave == "CPU") { if (valor > 0) dados.cpuTemp = filtrarTemp(filtroCpuTemp, valor); }
-        else if (chave == "PAGE") paginaPacote = (int)valor; // aplicada no fim do pacote
+        if (chave == "PAGE") paginaPacote = (int)valor; // aplicada no fim do pacote
         else if (chave == "R1") { r1Pacote = valor; conteudoCustomNoPacote = true; }
         else if (chave == "R2") { r2Pacote = valor; conteudoCustomNoPacote = true; }
-        else if (chave == "CPULOAD") dados.cpuLoad = valor;
-        else if (chave == "GPU") { if (valor > 0) dados.gpuTemp = filtrarTemp(filtroGpuTemp, valor); }
-        else if (chave == "GPULOAD") dados.gpuLoad = valor;
-        else if (chave == "CLK") dados.cpuClockMHz = valor;
-        else if (chave == "RAM") dados.ramUsadaGB = valor;
-        else if (chave == "RAMPCT") dados.ramPct = valor;
-        else if (chave == "VRAM") dados.vramUsadaGB = valor;
-        else if (chave == "LIMITERAM") limiteRamPct = valor;
         else if (chave == "REQVERSAO") {
           // o app pergunta a versao em vez de so esperar o DBG:versao= do
           // boot -- esse so sai UMA vez em setup(), e como o app abre a
@@ -484,7 +441,7 @@ void processarLinha(String linha) {
           // a ter o bug de tela recriando), ele nunca veria essa mensagem
           // ao reconectar num ESP32 que ja estava ligado. Responder aqui,
           // sob demanda, resolve isso -- o app so pergunta enquanto ainda
-          // nao sabe a versao (ver montar_linha() no orbepc_app.py).
+          // nao sabe a versao (ver montar_linha_pagina() no orbepc_app.py).
           Serial.printf("DBG:versao=%s\n", FIRMWARE_VERSAO);
         }
         else if (chave == "BRIGHT") {
@@ -528,6 +485,13 @@ void processarLinha(String linha) {
   if (r1Pacote >= 0) anelCustom1 = r1Pacote;
   if (r2Pacote >= 0) anelCustom2 = r2Pacote;
 
+  // icone/alerta: ao contrario de R1/R2, reflete o pacote INTEIRO (ver
+  // comentario na declaracao de iconePacote/alertaPacote mais acima)
+  for (int i = 0; i < 4; i++) {
+    iconeLinha[i] = iconePacote[i];
+    alertaLinha[i] = alertaPacote[i];
+  }
+
   // uma cor mudou nesse pacote -- limpa e redesenha do zero na cor nova
   // em vez de deixar o anel velho "manchado" com a cor antiga ate a
   // proxima variacao de uso. So faz isso fora do splash/transicao pra
@@ -541,7 +505,7 @@ void processarLinha(String linha) {
     grauCpuAtualF = grauGpuAtualF = GAUGE_INICIO;
     velCpuAtual = 0;
     velGpuAtual = 0;
-    for (int i = 0; i < 4; i++) linhasDesenhadas[i] = ""; // tela limpa -- linhas custom precisam redesenhar
+    for (int i = 0; i < 4; i++) { linhasDesenhadas[i] = ""; iconeDesenhado[i] = false; alertaDesenhado[i] = false; } // tela limpa -- linhas custom precisam redesenhar
   }
 
   ultimoDadoRecebido = millis();
@@ -575,7 +539,7 @@ void mostrarSplash() {
   mostrandoMensagem = true; // avisa desenharPainel() pra limpar a tela quando os dados chegarem
   mostrandoSplash = true;
   escalaDesenhada = false; // a tela vai ser limpa, a escala precisa ser redesenhada depois
-  for (int i = 0; i < 4; i++) linhasDesenhadas[i] = ""; // tela limpa -- linhas custom redesenham depois
+  for (int i = 0; i < 4; i++) { linhasDesenhadas[i] = ""; iconeDesenhado[i] = false; alertaDesenhado[i] = false; } // tela limpa -- linhas custom redesenham depois
   grauSpinner = 0;
   gfx->fillScreen(0x0000);
   textoCentralizado("OrbePC", CY - 12, 3, corLaranjaFixa);
@@ -910,16 +874,17 @@ void animarVarreduraBoot() {
     faseVarreduraBoot = 2;
     grauCpuAlvo = grauGpuAlvo = (int)round(GAUGE_INICIO);
   } else if (faseVarreduraBoot == 2) {
-    // varredura terminou -- entrega o controle pro valor real (se ja
-    // chegou algum dado enquanto isso; senao o proximo pacote recebido
-    // cuida disso normalmente, via desenharPainel())
+    // varredura terminou -- entrega o controle pro valor real (anelCustom1/2,
+    // ja atualizados pelos pacotes R1/R2 que chegaram durante a varredura;
+    // se nenhum pacote trouxe R1/R2 ainda, ficam em -1 e o anel so' sai do
+    // zero quando o proximo pacote chegar, via desenharPainelCustom() normal)
     emVarreduraBoot = false;
     faseVarreduraBoot = 0;
-    if (dados.cpuLoad >= 0) {
-      grauCpuAlvo = (int)round(GAUGE_INICIO + (dados.cpuLoad / 100.0) * (GAUGE_FIM - GAUGE_INICIO));
+    if (anelCustom1 >= 0) {
+      grauCpuAlvo = (int)round(GAUGE_INICIO + (anelCustom1 / 100.0) * (GAUGE_FIM - GAUGE_INICIO));
     }
-    if (dados.gpuLoad >= 0) {
-      grauGpuAlvo = (int)round(GAUGE_INICIO + (dados.gpuLoad / 100.0) * (GAUGE_FIM - GAUGE_INICIO));
+    if (anelCustom2 >= 0) {
+      grauGpuAlvo = (int)round(GAUGE_INICIO + (anelCustom2 / 100.0) * (GAUGE_FIM - GAUGE_INICIO));
     }
 
     // redesenha a escala do zero AQUI, nesse exato instante em que os aneis
@@ -1037,7 +1002,7 @@ void restaurarMarcasNaFaixa(int inicio, int fim) {
 // nao mexe em nada -- essas fases ja limpam tudo sozinhas ao terminar.
 void aoTrocarDePagina() {
   Serial.printf("DBG:pagina trocou para %d\n", paginaAtual);
-  for (int i = 0; i < 4; i++) linhasDesenhadas[i] = "";
+  for (int i = 0; i < 4; i++) { linhasDesenhadas[i] = ""; iconeDesenhado[i] = false; alertaDesenhado[i] = false; }
   anelCustom1 = anelCustom2 = -1; // pagina nova comeca sem anel, ate o pacote DELA mandar R1/R2
   escalaDesenhada = false;
   aneisPrecisamRedesenho = true;
@@ -1052,11 +1017,11 @@ void aoTrocarDePagina() {
   iniciarCortina(); // cobre a tela antiga aos poucos, em vez de corte seco
 }
 
-// renderizador generico das telas personalizadas: mesma escala e mesmos
-// aneis animados da tela classica (reaproveita grauCpu*/grauGpu* e a
-// animarAneis() -- "CPU" = anel externo, "GPU" = anel interno, so muda
-// de onde vem o alvo: R1/R2 em vez de cpuLoad/gpuLoad), com ate 4
-// linhas de texto ja formatadas pelo app.
+// renderizador generico de QUALQUER tela (Principal ou personalizada --
+// nao ha mais distincao no firmware, ver comentario em "DADOS RECEBIDOS"):
+// 2 aneis animados (R1 = anel externo, R2 = anel interno) e ate 4 linhas
+// de texto ja formatadas pelo app, cada uma com icone de termometro e/ou
+// alerta vermelho opcionais (IC1..4/AL1..4).
 void desenharPainelCustom() {
   if (!escalaDesenhada) {
     desenharEscala();
@@ -1079,24 +1044,39 @@ void desenharPainelCustom() {
     grauGpuAlvo = (int)round(GAUGE_INICIO + (anelCustom2 / 100.0) * (GAUGE_FIM - GAUGE_INICIO));
   }
 
-  // sem startWrite() externo -- textoCentralizado (print), fillRect e
-  // drawFastHLine abrem transacao SPI propria (aninhar = deadlock)
+  // sem startWrite() externo -- textoCentralizado/linhaTemperatura (print),
+  // fillRect e drawFastHLine abrem transacao SPI propria (aninhar = deadlock)
   const int alturasLinha[4] = { CY - 51, CY - 26, CY + 6, CY + 28 };
   uint16_t corCinza = gfx->color565(180, 180, 180);
-  uint16_t coresLinha[4] = { corCpuFixa, corGpuFixa, corCinza, corCinza };
+  uint16_t corVermelha = gfx->color565(255, 40, 40);
+  uint16_t coresLinhaPadrao[4] = { corCpuFixa, corGpuFixa, corCinza, corCinza };
 
   for (int i = 0; i < 4; i++) {
-    if (linhasCustom[i] == linhasDesenhadas[i]) continue;
-    // largura mudou (usuario trocou a metrica da vaga)? limpa a faixa.
-    // Com a mesma largura, o fundo do proprio texto apaga o valor antigo
-    // -- mesma tecnica sem-piscar da tela classica.
-    if (linhasCustom[i].length() != linhasDesenhadas[i].length()) {
+    // redesenha se o TEXTO mudou OU so' o icone/alerta mudou (ex: RAM
+    // cruzou o limite e precisa ficar vermelha, com o mesmo texto de antes)
+    bool mudou = linhasCustom[i] != linhasDesenhadas[i]
+                 || iconeLinha[i] != iconeDesenhado[i]
+                 || alertaLinha[i] != alertaDesenhado[i];
+    if (!mudou) continue;
+
+    // largura ou icone mudou (nao so' a cor)? limpa a faixa -- com o
+    // mesmo texto+icone, o fundo do proprio texto apaga o valor antigo,
+    // mesma tecnica sem-piscar de sempre (mas cor sozinha nao "limpa"
+    // nada, precisa redesenhar por cima mesmo com fundo igual).
+    if (linhasCustom[i].length() != linhasDesenhadas[i].length() || iconeLinha[i] != iconeDesenhado[i]) {
       gfx->fillRect(14, alturasLinha[i] - 1, 212, 18, 0x0000);
     }
     if (linhasCustom[i].length() > 0) {
-      textoCentralizado(linhasCustom[i], alturasLinha[i], 2, coresLinha[i]);
+      uint16_t cor = alertaLinha[i] ? corVermelha : coresLinhaPadrao[i];
+      if (iconeLinha[i]) {
+        linhaTemperatura(linhasCustom[i], alturasLinha[i], 2, cor);
+      } else {
+        textoCentralizado(linhasCustom[i], alturasLinha[i], 2, cor);
+      }
     }
     linhasDesenhadas[i] = linhasCustom[i];
+    iconeDesenhado[i] = iconeLinha[i];
+    alertaDesenhado[i] = alertaLinha[i];
   }
 
   gfx->drawFastHLine(CX - 45, CY - 3, 90, gfx->color565(50, 50, 50));
@@ -1114,73 +1094,10 @@ void desenharPainel() {
     mostrandoSplash = false;
     aneisPrecisamRedesenho = true;
     escalaDesenhada = false; // a tela foi limpa, a escala precisa ser redesenhada
-    for (int i = 0; i < 4; i++) linhasDesenhadas[i] = "";
+    for (int i = 0; i < 4; i++) { linhasDesenhadas[i] = ""; iconeDesenhado[i] = false; alertaDesenhado[i] = false; }
   }
 
-  // tela personalizada? o renderizador generico assume daqui
-  if (paginaAtual != 0) {
-    desenharPainelCustom();
-    return;
-  }
-
-  if (!escalaDesenhada) {
-    desenharEscala();
-    escalaDesenhada = true;
-  }
-
-  if (aneisPrecisamRedesenho) {
-    grauCpuAtual = grauCpuAlvo = (int)round(GAUGE_INICIO);
-    grauGpuAtual = grauGpuAlvo = (int)round(GAUGE_INICIO);
-    grauCpuAtualF = grauGpuAtualF = GAUGE_INICIO;
-    velCpuAtual = 0;
-    velGpuAtual = 0;
-    aneisPrecisamRedesenho = false;
-  }
-
-  // so atualiza o ALVO aqui -- quem realmente desenha o anel e a
-  // animarAneis(), chamada com frequencia pelo loop()
-  if (dados.cpuLoad >= 0) {
-    float fimCpu = GAUGE_INICIO + (dados.cpuLoad / 100.0) * (GAUGE_FIM - GAUGE_INICIO);
-    grauCpuAlvo = (int)round(fimCpu);
-  }
-  if (dados.gpuLoad >= 0) {
-    float fimGpu = GAUGE_INICIO + (dados.gpuLoad / 100.0) * (GAUGE_FIM - GAUGE_INICIO);
-    grauGpuAlvo = (int)round(fimGpu);
-  }
-
-  // NAO abrir startWrite() aqui: tudo abaixo (print via linhaTemperatura/
-  // textoCentralizado, drawFastHLine) abre a PROPRIA transacao SPI por
-  // dentro -- embrulhar numa transacao externa aninharia transacoes e
-  // travaria o SPI de hardware do ESP32 (mutex nao-recursivo)
-
-  // bloco de texto centralizado no meio do circulo -- largura sempre fixa
-  // (com espacos), entao a cor de fundo do proprio texto apaga o valor
-  // antigo, sem precisar limpar retangulo nenhum (rapido, sem "piscar")
-  // (char)248 = simbolo de grau na fonte padrao do Adafruit_GFX -- junto com
-  // o icone de termometro, deixa bem claro que esses dois valores sao temperatura
-  String linhaCpu = "CPU " + (dados.cpuTemp >= 0 ? largFixa(String(dados.cpuTemp, 0), 3) + String((char)248) + "C" : String(" --"));
-  String linhaGpu = "GPU " + (dados.gpuTemp >= 0 ? largFixa(String(dados.gpuTemp, 0), 3) + String((char)248) + "C" : String(" --"));
-  String linhaRam = "RAM " + (dados.ramUsadaGB >= 0 ? largFixa(String(dados.ramUsadaGB, 1), 4) : String("  --")) + " GB";
-  // sem espaco depois de "VRAM" de proposito -- "RAM " e "VRAM" ficam com
-  // exatamente 4 caracteres cada, entao as duas linhas tem a mesma largura
-  // total e o textoCentralizado() (que centraliza cada uma independente)
-  // acaba alinhando os rotulos e os valores na mesma coluna sozinho
-  String linhaVram = "VRAM" + (dados.vramUsadaGB >= 0 ? largFixa(String(dados.vramUsadaGB, 1), 4) : String("  --")) + " GB";
-
-  // bloco centralizado verticalmente em torno de CY (deslocado um pouco
-  // pra cima em relacao ao centro exato)
-  linhaTemperatura(linhaCpu, CY - 51, 2, corCpuFixa);
-  linhaTemperatura(linhaGpu, CY - 26, 2, corGpuFixa);
-
-  gfx->drawFastHLine(CX - 45, CY - 3, 90, gfx->color565(50, 50, 50));
-
-  uint16_t corCinza = gfx->color565(180, 180, 180);
-  uint16_t corVermelha = gfx->color565(255, 40, 40);
-  uint16_t corRam = (dados.ramPct >= limiteRamPct) ? corVermelha : corCinza;
-
-  textoCentralizado(linhaRam, CY + 6, 2, corRam);
-  textoCentralizado(linhaVram, CY + 28, 2, corGpuFixa);
-
-  // marca do produto, bem perto da borda inferior da tela (area sem anel)
-  textoCentralizado("OrbePC", CY + 82, 2, corLaranjaFixa);
+  // todas as telas (Principal inclusive) usam o mesmo renderizador
+  // generico agora -- ver comentario em "DADOS RECEBIDOS" mais acima.
+  desenharPainelCustom();
 }
