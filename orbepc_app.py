@@ -134,7 +134,7 @@ import atualizacao_engine
 # versao deste app -- comparada com a tag da release mais recente no
 # GitHub (ver atualizacao_engine.py) pra avisar quando tiver uma nova.
 # Suba isso a cada release publicada no repositorio.
-APP_VERSAO = "1.4.3"
+APP_VERSAO = "1.5.0"
 
 # de quanto em quanto tempo o app re-confere se tem versao nova do app/
 # firmware no GitHub Releases, enquanto fica aberto (ver verificar_atualizacoes()
